@@ -597,6 +597,11 @@ async function processMessage(
 
   const { error: msgError } = await supabaseAdmin().from('messages').insert({
     conversation_id: conversation.id,
+    // account_id added in migration 027 so the Realtime RLS policy can
+    // evaluate on the row alone (no JOIN to conversations required).
+    // Without this, Supabase Realtime drops the INSERT event and inbound
+    // messages are invisible until the agent replies and triggers a refetch.
+    account_id: accountId,
     sender_type: 'customer',
     content_type: contentType,
     content_text: contentText,

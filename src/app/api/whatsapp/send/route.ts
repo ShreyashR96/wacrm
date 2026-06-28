@@ -368,6 +368,7 @@ export async function POST(request: Request) {
       .from('messages')
       .insert({
         conversation_id,
+        account_id: accountId,
         sender_type: 'agent',
         content_type: message_type,
         content_text: content_text || null,
