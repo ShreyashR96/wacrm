@@ -209,11 +209,20 @@ export default function InboxPage() {
           setMessages((prev) => {
             // Avoid duplicates
             if (prev.some((m) => m.id === newMsg.id)) return prev;
-            // Replace optimistic message if it exists
-            const withoutOptimistic = prev.filter(
-              (m) => !m.id.startsWith("temp-")
-            );
-            return [...withoutOptimistic, newMsg];
+            // Replace the optimistic (temp-) bubble ONLY when the arriving
+            // DB row is an agent message — i.e. it IS the persisted version
+            // of the bubble we showed optimistically. Customer inbound
+            // messages must never wipe the agent's pending temp bubbles:
+            // that caused the agent's "hi" to disappear whenever a customer
+            // "Hey" Realtime event landed first, before the agent's own
+            // INSERT event returned from the DB.
+            if (newMsg.sender_type === "agent") {
+              const withoutOptimistic = prev.filter(
+                (m) => !m.id.startsWith("temp-")
+              );
+              return [...withoutOptimistic, newMsg];
+            }
+            return [...prev, newMsg];
           });
         }
 
