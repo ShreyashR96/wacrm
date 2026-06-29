@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
@@ -182,10 +182,21 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
-  // Process asynchronously so we can ack Meta within their timeout.
-  processWebhook(body).catch((error) => {
-    console.error('Error processing webhook:', error)
-  })
+  // CRITICAL FOR VERCEL: On Vercel serverless functions, the execution
+  // context is frozen (and the function killed) the moment the HTTP
+  // response is returned. The old fire-and-forget pattern:
+  //   processWebhook(body).catch(...)
+  //   return NextResponse.json({ status: 'received' })
+  // caused processWebhook to be abandoned before any DB writes ran —
+  // which is why inbound customer messages were never saved.
+  //
+  // `after()` from Next.js registers the promise with Vercel's runtime
+  // so the function stays alive until processWebhook settles, while
+  // still returning 200 immediately to stay within Meta's 15-second
+  // delivery timeout.
+  after(processWebhook(body).catch((error) => {
+    console.error('[webhook] unhandled error in processWebhook:', error)
+  }))
 
   return NextResponse.json({ status: 'received' }, { status: 200 })
 }
@@ -219,6 +230,13 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       // Handle incoming messages
       if (!value.messages || !value.contacts) continue
+
+      console.log('[webhook] inbound message(s) received:', {
+        phoneNumberId: value.metadata?.phone_number_id,
+        messageCount: value.messages.length,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        types: value.messages.map((m: any) => m.type),
+      })
 
       const phoneNumberId = value.metadata.phone_number_id
 
@@ -617,7 +635,15 @@ async function processMessage(
   })
 
   if (msgError) {
-    console.error('Error inserting message:', msgError)
+    console.error('[webhook] Error inserting inbound message:', {
+      message: msgError.message,
+      code: msgError.code,
+      details: msgError.details,
+      hint: msgError.hint,
+      conversation_id: conversation.id,
+      account_id: accountId,
+      meta_message_id: message.id,
+    })
     return
   }
 
@@ -940,15 +966,32 @@ async function findOrCreateConversation(
   configOwnerUserId: string,
   contactId: string,
 ) {
-  // Look for existing conversation in this account
+  // Look for the most-recent existing conversation in this account.
+  // `.single()` throws PGRST116 when there are 0 OR ≥2 rows, so a
+  // contact with multiple conversations (possible before dedup migrations)
+  // would cause every inbound message to silently create a new conversation
+  // instead of reusing the latest one. Use `.maybeSingle()` + limit + order
+  // so we always get the most recent open conversation or null.
   const { data: existing, error: findError } = await supabaseAdmin()
     .from('conversations')
     .select('*')
     .eq('account_id', accountId)
     .eq('contact_id', contactId)
-    .single()
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
 
-  if (!findError && existing) {
+  if (findError) {
+    console.error('[webhook] findOrCreateConversation: lookup failed:', {
+      accountId,
+      contactId,
+      message: findError.message,
+      code: findError.code,
+    })
+    // Fall through and try to create a new one.
+  }
+
+  if (existing) {
     return existing
   }
 
@@ -962,12 +1005,26 @@ async function findOrCreateConversation(
       contact_id: contactId,
     })
     .select()
-    .single()
+    .maybeSingle()
 
   if (createError) {
-    console.error('Error creating conversation:', createError)
+    console.error('[webhook] findOrCreateConversation: insert failed:', {
+      accountId,
+      contactId,
+      message: createError.message,
+      code: createError.code,
+    })
+    return null
+  }
+
+  if (!newConv) {
+    console.error('[webhook] findOrCreateConversation: insert returned no row', {
+      accountId,
+      contactId,
+    })
     return null
   }
 
   return newConv
 }
+
